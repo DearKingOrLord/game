@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Fantasy JS Quiz</title>
+
+<style>
+
+*{
+    margin:0;
+    padding:0;
+    box-sizing:border-box;
+    font-family:Arial, sans-serif;
+}
+
+body{
+    min-height:100vh;
+    display:flex;
+    justify-content:center;
+    align-items:center;
+    overflow:hidden;
+
+
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+
+    color:white;
+}
+
+
+.video-bg{
+    position:fixed;
+    top:0;
+    left:0;
+    width:100%;
+    height:100%;
+    overflow:hidden;
+    z-index:-2;
+}
+
+.video-bg iframe{
+    position:absolute;
+    top:50%;
+    left:50%;
+    width:120vw;
+    height:120vh;
+    transform:translate(-50%,-50%);
+    pointer-events:none;
+}
+
+body::after{
+    content:"";
+    position:fixed;
+    inset:0;
+    background:rgba(0,0,0,0.65);
+    z-index:-1;
+}
+
+/* Анимированный фон */
+
+body::before{
+    content:"";
+    position:absolute;
+    width:200%;
+    height:200%;
+    background:
+    url("https://www.transparenttextures.com/patterns/stardust.png");
+    opacity:0.2;
+    animation:moveBg 60s linear infinite;
+}
+
+@keyframes moveBg{
+    from{
+        transform:translate(0,0);
+    }
+    to{
+        transform:translate(-500px,-500px);
+    }
+}
+
+.game{
+    position:relative;
+    width:900px;
+    max-width:95%;
+    background:rgba(15,23,42,0.9);
+    border:2px solid #facc15;
+    border-radius:25px;
+    overflow:hidden;
+    box-shadow:
+    0 0 30px rgba(250,204,21,0.4),
+    0 0 80px rgba(99,102,241,0.3);
+    z-index:2;
+}
+
+.game{
+    position:relative;
+    z-index:2;
+}
+
+.header{
+    text-align:center;
+    padding:35px;
+    background:
+    linear-gradient(90deg,#312e81,#1e1b4b);
+    border-bottom:2px solid #facc15;
+}
+
+.header h1{
+    font-size:48px;
+    color:#facc15;
+    text-shadow:0 0 15px gold;
+}
+
+.header p{
+    margin-top:10px;
+    color:#cbd5e1;
+    font-size:18px;
+}
+
+.content{
+    padding:35px;
+}
+
+.progress{
+    height:14px;
+    background:#1e293b;
+    border-radius:20px;
+    overflow:hidden;
+    margin-bottom:30px;
+}
+
+.progress-bar{
+    height:100%;
+    width:0%;
+    background:
+    linear-gradient(90deg,#facc15,#fde047);
+    transition:0.4s;
+}
+
+.question{
+    font-size:30px;
+    margin-bottom:30px;
+    line-height:1.5;
+}
+
+.answers{
+    display:grid;
+    gap:18px;
+}
+
+button{
+    border:none;
+    padding:18px;
+    border-radius:18px;
+    background:#1e293b;
+    color:white;
+    font-size:18px;
+    cursor:pointer;
+    transition:0.3s;
+    border:2px solid transparent;
+}
+
+button:hover{
+    transform:scale(1.03);
+    border-color:#facc15;
+    background:#334155;
+}
+
+.correct{
+    background:#22c55e !important;
+}
+
+.wrong{
+    background:#ef4444 !important;
+}
+
+.nextBtn{
+    margin-top:25px;
+    background:#facc15;
+    color:black;
+    font-weight:bold;
+    display:none;
+}
+
+.score{
+    margin-top:20px;
+    font-size:22px;
+    color:#facc15;
+}
+
+.result{
+    display:none;
+    text-align:center;
+    padding:50px;
+}
+
+.result h2{
+    font-size:50px;
+    color:#facc15;
+    margin-bottom:20px;
+}
+
+.result p{
+    font-size:26px;
+}
+
+.restart{
+    margin-top:30px;
+    background:#6366f1;
+}
+
+.magic{
+    position:absolute;
+    width:8px;
+    height:8px;
+    background:gold;
+    border-radius:50%;
+    animation:float 6s linear infinite;
+    opacity:0.7;
+}
+
+@keyframes float{
+    from{
+        transform:translateY(100vh);
+    }
+    to{
+        transform:translateY(-100vh);
+    }
+}
+
+
+iframe{
+    position:fixed;
+    top:0;
+    left:0;
+    width:100vw;
+    height:100vh;
+    z-index:-1;
+    pointer-events:none;
+}
+
+</style>
+</head>
+
+
+
+
+
+
+
+<body>
+
+    <!-- Фоновое видео -->
+<div class="video-bg">
+
+<iframe
+src="https://www.youtube.com/embed/jNQXAC9IVRw?autoplay=1&mute=1&loop=1&playlist=jNQXAC9IVRw&controls=0&showinfo=0&modestbranding=1"
+frameborder="0"
+allow="autoplay"
+allowfullscreen>
+</iframe>
+
+</div>
+
+<div class="game">
+
+    <div class="header">
+        <h1>⚔ JavaScript Fantasy Quiz ⚔</h1>
+        <p>Массивы объектов в JavaScript</p>
+    </div>
+
+    <div class="content" id="quiz">
+
+        <div class="progress">
+            <div class="progress-bar" id="progressBar"></div>
+        </div>
+
+        <div class="question" id="question"></div>
+
+        <div class="answers" id="answers"></div>
+
+        <button class="nextBtn" id="nextBtn">
+            Следующий вопрос
+        </button>
+
+        <div class="score" id="score">
+            Очки: 0
+        </div>
+
+    </div>
+
+    <div class="result" id="result">
+        <h2>🎉 Победа!</h2>
+        <p id="finalText"></p>
+
+        <button class="restart" onclick="restartGame()">
+            Играть снова
+        </button>
+    </div>
+
+</div>
+
+<script>
+
+const questions = [
+
+{
+question:"Как создать массив объектов?",
+answers:[
+"let arr = [{name:'Tom'}]",
+"let arr = (name:'Tom')",
+"let arr = name:'Tom'",
+"let arr = <Tom>"
+],
+correct:0
+},
+
+{
+question:"Как получить имя первого объекта?",
+answers:[
+"arr.name",
+"arr[0].name",
+"arr:name",
+"arr->name"
+],
+correct:1
+},
+
+{
+question:"Что хранит объект?",
+answers:[
+"Только числа",
+"Только строки",
+"Свойства и значения",
+"Только массивы"
+],
+correct:2
+},
+
+{
+question:"Как добавить объект в массив?",
+answers:[
+"push()",
+"insert()",
+"newObject()",
+"appendObj()"
+],
+correct:0
+},
+
+{
+question:"Как удалить последний объект?",
+answers:[
+"shift()",
+"remove()",
+"pop()",
+"deleteLast()"
+],
+correct:2
+},
+
+{
+question:"Как перебрать массив объектов?",
+answers:[
+"forEach()",
+"repeat()",
+"cycle()",
+"loopObjects()"
+],
+correct:0
+},
+
+{
+question:"Как найти объект по условию?",
+answers:[
+"find()",
+"locate()",
+"searchObj()",
+"where()"
+],
+correct:0
+},
+
+{
+question:"Что вернет length?",
+answers:[
+"Размер объекта",
+"Количество элементов",
+"Последний объект",
+"Название массива"
+],
+correct:1
+},
+
+{
+question:"Как обратиться ко второму объекту?",
+answers:[
+"arr.second",
+"arr[2]",
+"arr[1]",
+"arr.object2"
+],
+correct:2
+},
+
+{
+question:"Что делает map()?",
+answers:[
+"Удаляет объекты",
+"Создает новый массив",
+"Останавливает цикл",
+"Сортирует"
+],
+correct:1
+},
+
+{
+question:"Какой тип данных у массива?",
+answers:[
+"string",
+"number",
+"object",
+"boolean"
+],
+correct:2
+},
+
+{
+question:"Что делает filter()?",
+answers:[
+"Фильтрует элементы",
+"Удаляет массив",
+"Создает объект",
+"Останавливает код"
+],
+correct:0
+},
+
+{
+question:"Можно ли хранить объекты внутри массива?",
+answers:[
+"Нет",
+"Только числа",
+"Да",
+"Только строки"
+],
+correct:2
+},
+
+{
+question:"Что выведет arr[0].age ?",
+answers:[
+"Возраст первого объекта",
+"Ошибка",
+"Ничего",
+"Функцию"
+],
+correct:0
+},
+
+{
+question:"Как отсортировать массив?",
+answers:[
+"sort()",
+"arraySort()",
+"organize()",
+"reorder()"
+],
+correct:0
+}
+
+];
+
+let currentQuestion = 0;
+let score = 0;
+
+const questionEl = document.getElementById("question");
+const answersEl = document.getElementById("answers");
+const nextBtn = document.getElementById("nextBtn");
+const scoreEl = document.getElementById("score");
+const progressBar = document.getElementById("progressBar");
+
+function showQuestion(){
+
+    nextBtn.style.display = "none";
+
+    const q = questions[currentQuestion];
+
+    questionEl.innerText = q.question;
+
+    answersEl.innerHTML = "";
+
+    q.answers.forEach((answer,index)=>{
+
+        const btn = document.createElement("button");
+
+        btn.innerText = answer;
+
+        btn.onclick = ()=>checkAnswer(index,btn);
+
+        answersEl.appendChild(btn);
+
+    });
+
+    progressBar.style.width =
+    (currentQuestion/questions.length)*100 + "%";
+}
+
+function checkAnswer(index,button){
+
+    const correct = questions[currentQuestion].correct;
+
+    const buttons =
+    document.querySelectorAll(".answers button");
+
+    buttons.forEach(btn=>{
+        btn.disabled = true;
+    });
+
+    if(index === correct){
+
+        button.classList.add("correct");
+        score++;
+
+    }else{
+
+        button.classList.add("wrong");
+        buttons[correct].classList.add("correct");
+    }
+
+    scoreEl.innerText = "Очки: " + score;
+
+    nextBtn.style.display = "block";
+}
+
+nextBtn.onclick = ()=>{
+
+    currentQuestion++;
+
+    if(currentQuestion < questions.length){
+
+        showQuestion();
+
+    }else{
+
+        finishGame();
+    }
+};
+
+function finishGame(){
+
+    document.getElementById("quiz").style.display = "none";
+
+    document.getElementById("result").style.display = "block";
+
+    document.getElementById("finalText").innerHTML =
+    `Ты набрал <b>${score}</b> из <b>${questions.length}</b> очков!`;
+
+    progressBar.style.width = "100%";
+}
+
+function restartGame(){
+
+    currentQuestion = 0;
+    score = 0;
+
+    document.getElementById("quiz").style.display = "block";
+
+    document.getElementById("result").style.display = "none";
+
+    scoreEl.innerText = "Очки: 0";
+
+    showQuestion();
+}
+
+showQuestion();
+
+/* Магические частицы */
+
+for(let i=0;i<40;i++){
+
+    const star = document.createElement("div");
+
+    star.classList.add("magic");
+
+    star.style.left = Math.random()*100 + "vw";
+
+    star.style.animationDuration =
+    (Math.random()*5+3) + "s";
+
+    star.style.opacity = Math.random();
+
+    document.body.appendChild(star);
+}
+
+</script>
+
+</body>
+</html>

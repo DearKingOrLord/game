@@ -26,21 +26,93 @@ Raycasting Minecraft-like — оптимизированная версия на
 """
 import math
 import os
+import sys
+import traceback
 
-import numpy as np
+# ---------------------------------------------------- ПОКАЗ ОШИБОК --------
+# Если игра падает (например, на телефоне), текст ошибки показывается на
+# экране и сохраняется в raycaster_error.txt рядом со скриптом.
+try:
+    _ERR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "raycaster_error.txt")
+except Exception:
+    _ERR_FILE = "raycaster_error.txt"
+
+
+def show_error(text):
+    print(text)
+    try:
+        with open(_ERR_FILE, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        pass
+    try:
+        import pygame as pg
+        pg.init()
+        scr = pg.display.get_surface() or pg.display.set_mode((0, 0))
+        w, h = scr.get_size()
+        fnt = pg.font.SysFont(None, max(22, h // 32))
+        lines = ["ОШИБКА (коснитесь экрана, чтобы выйти):", ""]
+        for line in text.splitlines():
+            while len(line) > 70:
+                lines.append(line[:70])
+                line = "  " + line[70:]
+            lines.append(line)
+        scr.fill((25, 0, 0))
+        y = 10
+        for line in lines[-(h // fnt.get_linesize()):]:
+            scr.blit(fnt.render(line, True, (255, 220, 220)), (10, y))
+            y += fnt.get_linesize()
+        pg.display.flip()
+        while True:
+            e = pg.event.wait()
+            if e.type in (pg.QUIT, pg.KEYDOWN, pg.MOUSEBUTTONDOWN):
+                break
+        pg.quit()
+    except Exception:
+        pass
+
+
+def _excepthook(tp, val, tb):
+    show_error("".join(traceback.format_exception(tp, val, tb)))
+
+
+sys.excepthook = _excepthook
+
+try:
+    import numpy as np
+except ImportError:
+    show_error("Не установлен numpy.\n\nPydroid 3: меню -> Pip -> numpy -> Install\n"
+               "ПК: pip install numpy")
+    sys.exit(1)
+
+# телефон: просим альбомную ориентацию (до pygame.init)
+IS_ANDROID = hasattr(sys, "getandroidapilevel") or "ANDROID_ROOT" in os.environ
+if IS_ANDROID:
+    os.environ.setdefault("SDL_IOS_ORIENTATIONS", "LandscapeLeft LandscapeRight")
+
 import pygame
 from pygame.locals import *
 
 pygame.init()
 
-# ---------------------------------------------------------------- ЭКРАН ----
-WIDTH, HEIGHT = 2060, 1040
-_info = pygame.display.Info()
-if _info.current_w > 0 and _info.current_h > 0:
-    WIDTH = min(WIDTH, _info.current_w)
-    HEIGHT = min(HEIGHT, _info.current_h)
+# события, которых нет в старых версиях pygame
+EV_MOUSEWHEEL = getattr(pygame, "MOUSEWHEEL", -101)
+EV_FINGERDOWN = getattr(pygame, "FINGERDOWN", -102)
+EV_FINGERUP = getattr(pygame, "FINGERUP", -103)
+EV_FINGERMOTION = getattr(pygame, "FINGERMOTION", -104)
 
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
+# ---------------------------------------------------------------- ЭКРАН ----
+if IS_ANDROID:
+    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+else:
+    WIDTH, HEIGHT = 2060, 1040
+    _info = pygame.display.Info()
+    if _info.current_w > 0 and _info.current_h > 0:
+        WIDTH = min(WIDTH, _info.current_w)
+        HEIGHT = min(HEIGHT, _info.current_h)
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+WIDTH, HEIGHT = screen.get_size()
+UI = max(0.6, min(WIDTH, HEIGHT) / 1040)        # масштаб интерфейса
 pygame.display.set_caption("Raycasting Minecraft-like (numpy)")
 
 # ---------------------------------------------------------------- КАРТА ----
@@ -93,22 +165,22 @@ MAX_STEPS = MAP_W + MAP_H + 4
 
 # --------------------------------------------------------------- ТЕКСТУРЫ --
 TEX = 16
-rng = np.random.default_rng(1337)
+rng = np.random.RandomState(1337)   # есть во всех версиях numpy
 
 
 def _noise(lo, hi):
-    return rng.integers(lo, hi + 1, (TEX, TEX, 1)).astype(np.float32)
+    return rng.randint(lo, hi + 1, (TEX, TEX, 1)).astype(np.float32)
 
 
 def tex_stone():
     t = np.array([125, 125, 128], np.float32) + _noise(-16, 16)
-    spots = rng.random((TEX, TEX)) < 0.08
+    spots = rng.random_sample((TEX, TEX)) < 0.08
     t[spots] *= 0.75
     return t
 
 
 def tex_cobble():
-    pts = rng.random((11, 2)) * TEX
+    pts = rng.random_sample((11, 2)) * TEX
     yy, xx = np.mgrid[0:TEX, 0:TEX].astype(np.float32)
     # расстояния с учётом тайлинга
     d = np.full((len(pts), TEX, TEX), 1e9, np.float32)
@@ -147,10 +219,10 @@ def tex_planks(vertical=False):
         sh = rng.uniform(0.88, 1.08)
         t[p * 4:(p + 1) * 4] = base * sh
         t[p * 4 + 3] = base * 0.6
-        seam = rng.integers(0, TEX)
+        seam = rng.randint(0, TEX)
         t[p * 4:p * 4 + 3, seam] = base * 0.7
     t += _noise(-7, 7)
-    grain = rng.random((TEX, TEX)) < 0.12
+    grain = rng.random_sample((TEX, TEX)) < 0.12
     t[grain] *= 0.88
     if vertical:
         t = t.transpose(1, 0, 2).copy()
@@ -172,8 +244,8 @@ def tex_door():
 
 def tex_grass():
     t = np.array([88, 150, 52], np.float32) + _noise(-14, 14)
-    light = rng.random((TEX, TEX)) < 0.1
-    dark = rng.random((TEX, TEX)) < 0.1
+    light = rng.random_sample((TEX, TEX)) < 0.1
+    dark = rng.random_sample((TEX, TEX)) < 0.1
     t[light] *= 1.18
     t[dark] *= 0.8
     return t
@@ -223,10 +295,10 @@ def build_sky(night):
         top, hor = np.array((4, 6, 20), np.float32), np.array((22, 28, 58), np.float32)
     sky = top + (hor - top) * rows ** 1.5
     sky = np.repeat(sky, SKY_W, axis=0)
-    r = np.random.default_rng(7 if night else 3)
+    r = np.random.RandomState(7 if night else 3)
     if not night:
         # блочные облака как в Minecraft
-        cells = r.random((SKY_W // 16, 12)) > 0.62
+        cells = r.random_sample((SKY_W // 16, 12)) > 0.62
         cells = np.repeat(np.repeat(cells, 16, 0), 8, 1)
         band = slice(SKY_H - 150, SKY_H - 54)
         sky[:, band][cells] = sky[:, band][cells] * 0.25 + np.array((250, 250, 255)) * 0.75
@@ -234,7 +306,7 @@ def build_sky(night):
         sky[296:344, 86:134] = sky[296:344, 86:134] * 0.5 + np.array((255, 245, 200)) * 0.5
         sky[304:336, 94:126] = (255, 255, 235)
     else:
-        stars = r.random((SKY_W, SKY_H)) < 0.004
+        stars = r.random_sample((SKY_W, SKY_H)) < 0.004
         stars[:, SKY_H - 25:] = False
         b = r.uniform(140, 255, (SKY_W, SKY_H))
         sky[stars] = b[stars][:, None]
@@ -317,7 +389,7 @@ def compute_static_light():
 
 
 # ----------------------------------------------------- РАЗРЕШЕНИЕ РЕНДЕРА --
-RENDER_DIV = 4
+RENDER_DIV = max(4, round(WIDTH / 400)) if IS_ANDROID else 4
 RW = RH = 0
 PROJ = 0.0
 CAM_X = None
@@ -554,10 +626,17 @@ def make_block_icon(tile_id, size):
     return pygame.image.frombuffer(arr.tobytes(), (S, S), "RGBA").convert_alpha()
 
 
-ICON_SMALL = {b: make_block_icon(b, 48) for b in HOTBAR}
-ICON_HAND = {b: make_block_icon(b, 220) for b in HOTBAR}
+ICON_SMALL = {b: make_block_icon(b, int(48 * UI)) for b in HOTBAR}
+ICON_HAND = {b: make_block_icon(b, int(220 * UI)) for b in HOTBAR}
 
 # ---------------------------------------------------------- TOUCH-КНОПКИ ---
+def rrect(surf, color, rect, width=0, radius=0):
+    try:
+        pygame.draw.rect(surf, color, rect, width, border_radius=radius)
+    except TypeError:                     # старый pygame без border_radius
+        pygame.draw.rect(surf, color, rect, width)
+
+
 class TouchButton:
     def __init__(self, rect, label):
         self.rect = pygame.Rect(rect)
@@ -568,8 +647,8 @@ class TouchButton:
 
     def _make(self, down):
         s = pygame.Surface(self.rect.size, pygame.SRCALPHA)
-        pygame.draw.rect(s, (255, 255, 255, 150 if down else 70), s.get_rect(), border_radius=14)
-        pygame.draw.rect(s, (255, 255, 255, 200), s.get_rect(), 2, border_radius=14)
+        rrect(s, (255, 255, 255, 150 if down else 70), s.get_rect(), 0, 14)
+        rrect(s, (255, 255, 255, 200), s.get_rect(), 2, 14)
         txt = btn_font.render(self.label, True, (20, 20, 20) if down else (255, 255, 255))
         s.blit(txt, txt.get_rect(center=s.get_rect().center))
         return s
@@ -597,11 +676,11 @@ class TouchButton:
         surface.blit(self.surf_down if self.active else self.surf_up, self.rect)
 
 
-btn_font = pygame.font.SysFont(None, 40)
-font = pygame.font.SysFont(None, 26)
-big_font = pygame.font.SysFont(None, 34)
+btn_font = pygame.font.SysFont(None, int(40 * UI))
+font = pygame.font.SysFont(None, max(18, int(26 * UI)))
+big_font = pygame.font.SysFont(None, int(34 * UI))
 
-BS, PAD = 80, 20
+BS, PAD = int(80 * UI * (1.4 if IS_ANDROID else 1)), int(20 * UI)
 mcx, mcy = PAD + BS + 8, HEIGHT - BS - PAD
 rcx, rcy = WIDTH - PAD - 2 * BS - 8, HEIGHT - BS - PAD
 buttons = {
@@ -617,7 +696,7 @@ buttons = {
 }
 show_buttons = True
 
-SLOT = 64
+SLOT = int(64 * UI)
 hotbar_rect = pygame.Rect(0, 0, SLOT * len(HOTBAR) + 8, SLOT + 8)
 hotbar_rect.midbottom = (WIDTH // 2, HEIGHT - 14)
 
@@ -629,7 +708,7 @@ def hotbar_slot_at(pos):
 
 
 # -------------------------------------------------------------- МИНИКАРТА --
-MM_SCALE = 10
+MM_SCALE = max(5, int(10 * UI))
 minimap = None
 
 
@@ -764,7 +843,7 @@ def draw_hand():
     bx = math.cos(bob_phase * 0.5) * 14 * bob_amount
     by = abs(math.sin(bob_phase * 0.5)) * 14 * bob_amount
     sw = math.sin(hand_swing * math.pi)
-    x = WIDTH - icon.get_width() - 230 + bx - sw * 60
+    x = WIDTH - icon.get_width() - 230 * UI + bx - sw * 60 * UI
     y = HEIGHT - icon.get_height() * 0.72 + by + sw * 40
     # тень от освещения: ночью рука темнее
     k = 1.0 - 0.6 * night
@@ -803,6 +882,8 @@ def main():
     fps_timer = 0.0
     t = 0.0
     prev_use = False
+    touch_used = False        # после первого касания игнорируем "мышь" из касаний
+    perf_t, perf_n, auto_res = 0.0, 0, True
 
     def set_mouse_look(on):
         nonlocal mouse_look
@@ -813,8 +894,18 @@ def main():
 
     running = True
     while running:
-        dt = min(clock.tick(120) / 1000.0, 0.05)
+        raw_dt = clock.tick(120) / 1000.0
+        dt = min(raw_dt, 0.05)
         t += dt
+
+        # авто-качество: если долго < 25 FPS, уменьшаем разрешение рендера
+        if auto_res and t > 1.5:
+            perf_t += raw_dt
+            perf_n += 1
+            if perf_t > 2.0:
+                if perf_t / perf_n > 1 / 25 and RENDER_DIV < 8:
+                    setup_resolution(RENDER_DIV + 1)
+                perf_t, perf_n = 0.0, 0
 
         for event in pygame.event.get():
             if event.type == QUIT:
@@ -832,8 +923,10 @@ def main():
                 elif event.key == K_n:
                     night_target = 1.0 - night_target
                 elif event.key in (K_EQUALS, K_PLUS, K_KP_PLUS):
+                    auto_res = False
                     setup_resolution(RENDER_DIV - 1)
                 elif event.key in (K_MINUS, K_KP_MINUS):
+                    auto_res = False
                     setup_resolution(RENDER_DIV + 1)
                 elif event.key == K_h:
                     show_buttons = not show_buttons
@@ -849,7 +942,7 @@ def main():
                 keys_held.discard(event.key)
 
             # мышь (события, эмулированные из касаний, пропускаем)
-            elif event.type == MOUSEBUTTONDOWN and not getattr(event, "touch", False):
+            elif event.type == MOUSEBUTTONDOWN and not (touch_used or getattr(event, "touch", False)):
                 if event.button in (4, 5):
                     continue
                 if mouse_look:
@@ -866,10 +959,10 @@ def main():
                         break_block()
                     elif event.button == 3:
                         place_block()
-            elif event.type == MOUSEBUTTONUP and not getattr(event, "touch", False):
+            elif event.type == MOUSEBUTTONUP and not (touch_used or getattr(event, "touch", False)):
                 for b in buttons.values():
                     b.release("mouse")
-            elif event.type == MOUSEMOTION and not getattr(event, "touch", False):
+            elif event.type == MOUSEMOTION and not (touch_used or getattr(event, "touch", False)):
                 if mouse_look:
                     p_angle += event.rel[0] * MOUSE_SENS
                     pitch = max(-0.45, min(0.45, pitch - event.rel[1] * MOUSE_SENS * 0.8))
@@ -877,20 +970,21 @@ def main():
                     for b in buttons.values():
                         if "mouse" in b.pointers:
                             b.move("mouse", event.pos)
-            elif event.type == MOUSEWHEEL:
+            elif event.type == EV_MOUSEWHEEL:
                 selected_slot = (selected_slot - event.y) % len(HOTBAR)
 
             # мультитач
-            elif event.type in (FINGERDOWN, FINGERMOTION, FINGERUP):
+            elif event.type in (EV_FINGERDOWN, EV_FINGERMOTION, EV_FINGERUP):
                 pos = (int(event.x * WIDTH), int(event.y * HEIGHT))
                 pid = ("finger", event.finger_id)
-                if event.type == FINGERDOWN:
+                touch_used = True
+                if event.type == EV_FINGERDOWN:
                     slot = hotbar_slot_at(pos)
                     if slot is not None:
                         selected_slot = slot
                     for b in buttons.values():
                         b.press(pid, pos)
-                elif event.type == FINGERMOTION:
+                elif event.type == EV_FINGERMOTION:
                     for b in buttons.values():
                         b.move(pid, pos)
                 else:
@@ -978,4 +1072,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        show_error(traceback.format_exc())

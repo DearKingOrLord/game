@@ -9,8 +9,8 @@
 Телефон:
   левая половина экрана — джойстик (ходьба)
   правая половина — провести пальцем: осмотреться
-                    коротко коснуться: сломать блок
-                    подержать палец: поставить блок
+                    коротко коснуться: поставить блок
+                    подержать палец: сломать блок
   кнопка со стрелкой — прыжок (в полёте — вверх), рядом — полёт и вниз
   хотбар внизу — выбор блока
 
@@ -739,7 +739,7 @@ name_timer = 2.0
 
 def hotbar_slot_at(p):
     if hotbar_rect.collidepoint(p):
-        return min(len(HOTBAR) - 1, (p[0] - hotbar_rect.x - 4) // SLOT)
+        return min(len(HOTBAR) - 1, int(p[0] - hotbar_rect.x - 4) // SLOT)
     return None
 
 
@@ -821,8 +821,9 @@ btn_fly = Button((btn_jump.c[0], btn_jump.c[1] - int(BR * 2.4)), int(BR * 0.8), 
 JOY_R = int(90 * UI * (1.5 if MOBILE else 1))
 JOY_HOME = (int(JOY_R * 1.5), HEIGHT - int(JOY_R * 1.4))
 
-TAP_TIME = 0.28          # короче — "тап" (сломать)
-HOLD_TIME = 0.45         # дольше без движения — поставить блок
+TAP_TIME = 0.28          # короче — "тап" (поставить блок)
+HOLD_TIME = 0.45         # держать без движения — сломать блок
+BREAK_REPEAT = 0.35      # продолжаешь держать — ломает дальше
 MOVE_SLOP = 12 * UI      # смещение пальца, после которого это уже свайп
 LOOK_SENS = 0.0065 / UI  # радиан на логический пиксель
 
@@ -860,7 +861,7 @@ def main():
 
     def select(i):
         global selected, name_timer
-        selected = i % len(HOTBAR)
+        selected = int(i) % len(HOTBAR)
         name_timer = 2.0
 
     running = True
@@ -948,7 +949,7 @@ def main():
                     if p[0] < WIDTH * 0.42 and joy is None:
                         joy = [pid, p, p]
                     else:
-                        look[pid] = {"start": p, "t0": t, "last": p, "moved": False, "placed": False}
+                        look[pid] = {"start": p, "t0": t, "last": p, "moved": False, "placed": False, "next": HOLD_TIME}
                 elif e.type == EV_FINGERMOTION:
                     if joy is not None and joy[0] == pid:
                         joy[2] = p
@@ -968,16 +969,17 @@ def main():
                         L = look.pop(pid)
                         if not L["moved"] and not L["placed"] and t - L["t0"] < TAP_TIME + 0.15:
                             target = pick_block()
-                            do_break()
+                            do_place()
                     for b in (btn_jump, btn_fly, btn_down):
                         b.pointers.discard(pid)
 
-        # долгое нажатие -> поставить блок
+        # долгое нажатие -> ломать блок (повторяется, пока держишь)
         for L in look.values():
-            if not L["moved"] and not L["placed"] and t - L["t0"] >= HOLD_TIME:
-                L["placed"] = True
+            if not L["moved"] and t - L["t0"] >= L["next"]:
+                L["placed"] = True           # было долгое нажатие — тапом не считаем
+                L["next"] += BREAK_REPEAT
                 target = pick_block()
-                do_place()
+                do_break()
 
         # ---- движение ----
         mf = ms = 0.0

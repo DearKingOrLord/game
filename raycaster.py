@@ -23,6 +23,11 @@ Raycasting Minecraft-like — оптимизированная версия на
   M — захват мыши (обзор мышью), ЛКМ — сломать, ПКМ — поставить блок
   1-5 / колесо — выбор блока, E — открыть/закрыть дверь
   N — день/ночь, +/- — качество рендера, H — скрыть touch-кнопки, F3 — отладка
+
+Телефон (Pydroid 3):
+  кнопки W A S D — ходьба, < > — поворот, E — дверь, X — сломать, + — поставить
+  провести пальцем по пустому месту экрана — осмотреться (как мышью)
+  касание хотбара — выбор блока. Качество подстраивается под FPS само.
 """
 import math
 import os
@@ -102,8 +107,24 @@ EV_FINGERUP = getattr(pygame, "FINGERUP", -103)
 EV_FINGERMOTION = getattr(pygame, "FINGERMOTION", -104)
 
 # ---------------------------------------------------------------- ЭКРАН ----
-if IS_ANDROID:
-    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+# На телефоне рисуем в небольшом "логическом" окне (высота ~430 px),
+# а растягивает его до экрана видеокарта (флаг SCALED) — это намного
+# быстрее, чем гонять 2.6 млн пикселей через процессор каждый кадр.
+MOBILE = IS_ANDROID or os.environ.get("RAYCASTER_MOBILE") == "1"
+screen = None
+if MOBILE:
+    _info = pygame.display.Info()
+    _pw, _ph = max(_info.current_w, 1), max(_info.current_h, 1)
+    if _ph > _pw:
+        _pw, _ph = _ph, _pw                      # считаем в альбомной ориентации
+    _lh = 432
+    _lw = max(640, int(_lh * _pw / _ph))
+    try:
+        screen = pygame.display.set_mode((_lw, _lh), pygame.SCALED | pygame.FULLSCREEN)
+    except Exception:
+        screen = None
+    if screen is None:
+        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
 else:
     WIDTH, HEIGHT = 2060, 1040
     _info = pygame.display.Info()
@@ -112,9 +133,8 @@ else:
         HEIGHT = min(HEIGHT, _info.current_h)
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
 WIDTH, HEIGHT = screen.get_size()
-UI = max(0.6, min(WIDTH, HEIGHT) / 1040)        # масштаб интерфейса
+UI = max(0.35, min(WIDTH, HEIGHT) / 1040)       # масштаб интерфейса
 pygame.display.set_caption("Raycasting Minecraft-like (numpy)")
-
 # ---------------------------------------------------------------- КАРТА ----
 # 0 - пусто, 1 - камень, 2 - кирпич, 3 - доски, 4 - дверь, 5 - булыжник
 grid = np.array([
@@ -156,6 +176,8 @@ pitch = 0.0              # вертикальный обзор (в долях в
 MOVE_SPEED = 3.0
 ROT_SPEED = 2.6
 MOUSE_SENS = 0.0025
+TOUCH_LOOK_X = 4.0     # поворот за свайп через весь экран (рад)
+TOUCH_LOOK_Y = 1.2
 PLAYER_R = 0.2
 REACH = 4.0
 
@@ -389,30 +411,91 @@ def compute_static_light():
 
 
 # ----------------------------------------------------- РАЗРЕШЕНИЕ РЕНДЕРА --
-RENDER_DIV = max(4, round(WIDTH / 400)) if IS_ANDROID else 4
+# Все цвета храним "упакованными" в одно 32-битное число (как в самой
+# поверхности pygame). Тогда текстура выбирается одной операцией, а свет и
+# туман накладываются быстрыми C-блитами pygame вместо float-математики
+# по трём каналам.
+RENDER_DIV = 3 if MOBILE else 4
 RW = RH = 0
 PROJ = 0.0
 CAM_X = None
-small = None
+COLS = None
+small = light_surf = fog_surf = None
+SH = (16, 8, 0)
+WHITE = 0
+
+
+def pack(rgb):
+    a = np.clip(rgb, 0, 255).astype(np.uint32)
+    return (a[..., 0] << SH[0]) | (a[..., 1] << SH[1]) | (a[..., 2] << SH[2])
 
 
 def setup_resolution(div):
-    global RENDER_DIV, RW, RH, PROJ, CAM_X, small, ROW_IDX
+    global RENDER_DIV, RW, RH, PROJ, CAM_X, COLS, ROW_IDX, small, light_surf, fog_surf
+    global SH, WHITE, ATLAS_P, FLOOR_P, sky_packed_night
     RENDER_DIV = max(2, min(8, div))
     RW, RH = WIDTH // RENDER_DIV, HEIGHT // RENDER_DIV
     PROJ = (RW / 2) / PLANE
     CAM_X = (2 * (np.arange(RW, dtype=np.float32) + 0.5) / RW - 1).astype(np.float32)
+    COLS = np.arange(RW)[:, None]
     ROW_IDX = np.arange(RH, dtype=np.float32)
     small = pygame.Surface((RW, RH)).convert()
+    if small.get_bitsize() != 32:
+        small = pygame.Surface((RW, RH), 0, 32)
+    light_surf = small.copy()
+    fog_surf = pygame.Surface((RW, RH), pygame.SRCALPHA, 32)
+    SH = tuple(small.get_shifts()[:3])
+    WHITE = int(pack(np.array((255, 255, 255))))
+    ATLAS_P = pack(atlas)                                   # (тайл, y, x)
+    # пол всей карты одной текстурой: (MAP_H*16, MAP_W*16)
+    fw = atlas[floor_map].transpose(0, 2, 1, 3, 4).reshape(MAP_H * TEX, MAP_W * TEX, 3)
+    FLOOR_P = pack(fw)
+    sky_packed_night = -1.0
+
+
+ATLAS_P = FLOOR_P = SKY_P = None
+sky_packed_night = -1.0
+TORCH_SURFS = []
+GLOW_SURF = None
+
+
+def build_sprite_surfaces():
+    global TORCH_SURFS, GLOW_SURF
+    TORCH_SURFS = []
+    for fr in TORCH_FRAMES:
+        rgba = np.zeros((TEX, TEX, 4), np.uint8)
+        rgba[..., :3] = fr[..., :3]
+        rgba[..., 3] = (fr[..., 3] > 0) * 255
+        s = pygame.image.frombuffer(np.ascontiguousarray(rgba).tobytes(), (TEX, TEX), "RGBA")
+        TORCH_SURFS.append(s.convert_alpha())
+    n = 64
+    g = (np.arange(n) + 0.5) / n * 2 - 1
+    r = np.clip(1 - np.sqrt(g[:, None] ** 2 + g[None, :] ** 2), 0, 1) ** 2
+    rgb = (r[..., None] * TORCH_COLOR / TORCH_COLOR.max() * 255).astype(np.uint8)
+    GLOW_SURF = pygame.Surface((n, n)).convert()
+    pygame.surfarray.blit_array(GLOW_SURF, rgb)
+
+
+def _runs(mask):
+    """Непрерывные участки True -> список (start, end)."""
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        return []
+    br = np.flatnonzero(np.diff(idx) > 1)
+    starts = np.concatenate(([idx[0]], idx[br + 1]))
+    ends = np.concatenate((idx[br], [idx[-1]])) + 1
+    return list(zip(starts.tolist(), ends.tolist()))
 
 
 # ------------------------------------------------------------ РЕНДЕР -------
 # результат центрального луча (для ломания/постановки блоков)
 target = None          # (hit_cell, prev_cell, dist)
 
+AO_LEVELS = 5          # ступени затемнения низа стены
+
 
 def render_world(t):
-    global sky_cur, sky_cur_night, target
+    global sky_cur, sky_cur_night, target, SKY_P, sky_packed_night
     dir_x, dir_y = math.cos(p_angle), math.sin(p_angle)
     pl_x, pl_y = -dir_y * PLANE, dir_x * PLANE
     rdx = (dir_x + pl_x * CAM_X).astype(np.float32)
@@ -421,7 +504,7 @@ def render_world(t):
     horizon = int(RH / 2 + pitch * RH)
     cam_z = 0.5 + math.sin(bob_phase) * 0.018 * bob_amount
 
-    # ---- DDA для всех столбцов сразу ----
+    # ---- DDA для всех столбцов сразу (карта замкнута стенами) ----
     mx = np.full(RW, int(px), np.int32)
     my = np.full(RW, int(py), np.int32)
     with np.errstate(divide="ignore"):
@@ -431,33 +514,27 @@ def render_world(t):
     sty = np.where(rdy < 0, -1, 1).astype(np.int32)
     sdx = np.where(rdx < 0, (px - mx) * ddx, (mx + 1.0 - px) * ddx).astype(np.float32)
     sdy = np.where(rdy < 0, (py - my) * ddy, (my + 1.0 - py) * ddy).astype(np.float32)
-    hit = np.zeros(RW, bool)
+    act = np.ones(RW, bool)
     side = np.zeros(RW, bool)          # False - грань X, True - грань Y
-    tile = np.zeros(RW, np.int32)
     for _ in range(MAX_STEPS):
-        act = ~hit
-        if not act.any():
-            break
         go_x = act & (sdx < sdy)
-        go_y = act & ~go_x
+        go_y = act ^ go_x
         sdx += ddx * go_x
         mx += stx * go_x
         sdy += ddy * go_y
         my += sty * go_y
-        side = np.where(go_x, False, np.where(go_y, True, side))
-        np.clip(mx, 0, MAP_W - 1, out=mx)
-        np.clip(my, 0, MAP_H - 1, out=my)
-        cell = grid[my, mx]
-        new = act & (cell != 0)
-        tile = np.where(new, cell, tile)
-        hit |= new
+        np.copyto(side, go_y, where=act)
+        act &= grid[my, mx] == 0
+        if not act.any():
+            break
+    tile = grid[my, mx]
 
     perp = np.maximum(np.where(side, sdy - ddy, sdx - ddx), 1e-4).astype(np.float32)
     hx = px + rdx * perp
     hy = py + rdy * perp
     wall_x = np.where(side, hx, hy)
     wall_x -= np.floor(wall_x)
-    tex_x = np.clip((wall_x * TEX).astype(np.int32), 0, TEX - 1)
+    tex_x = np.minimum((wall_x * TEX).astype(np.int32), TEX - 1)
     flip = (~side & (rdx > 0)) | (side & (rdy < 0))
     tex_x = np.where(flip, TEX - 1 - tex_x, tex_x)
 
@@ -470,69 +547,53 @@ def render_world(t):
     else:
         target = None
 
-    # ---- освещение на этот кадр ----
+    # ---- освещение на этот кадр (маленькие массивы) ----
     amb = AMB_DAY + (AMB_NIGHT - AMB_DAY) * night
     fog_col = FOG_DAY + (FOG_NIGHT - FOG_DAY) * night
     fog_start, fog_end = 6.0 - 3.0 * night, 18.0 - 8.0 * night
     flick = np.array([0.88 + 0.08 * math.sin(t * 11 + i * 1.7) + 0.04 * math.sin(t * 27 + i * 3.1)
                       for i in range(len(TORCHES))], np.float32)
     torch_map = np.tensordot(flick, LIGHT_BASES, axes=1) * (0.45 + 0.75 * night)
-    floor_light = AO_MAP[..., None] * amb + torch_map[..., None] * TORCH_COLOR
+    LM_P = pack((AO_MAP[..., None] * amb + torch_map[..., None] * TORCH_COLOR) * 255)
 
-    frame = np.empty((RW, RH, 3), np.float32)
+    C = np.empty((RW, RH), np.uint32)       # цвет текстуры
+    L = np.empty((RW, RH), np.uint32)       # свет (умножается на цвет)
+    F = np.zeros((RW, RH), np.uint8)        # плотность тумана
 
     # ---- небо ----
     sky_rows = min(max(horizon + 1, 0), RH)
-    if abs(night - sky_cur_night) > 0.004:
-        sky_cur = SKY_DAY + (SKY_NIGHT - SKY_DAY) * night
-        sky_cur_night = night
+    if abs(night - sky_packed_night) > 0.02 or SKY_P is None:
+        SKY_P = pack(SKY_DAY + (SKY_NIGHT - SKY_DAY) * night)
+        sky_packed_night = night
     if sky_rows > 0:
         ang = np.arctan2(rdy, rdx)
-        col = ((ang / (2 * math.pi) * SKY_W).astype(np.int32) + int(t * 3)) % SKY_W
+        col = ((ang * (SKY_W / (2 * math.pi))).astype(np.int32) + int(t * 3)) % SKY_W
         elev = np.arctan((horizon - ROW_IDX[:sky_rows] + 0.5) / PROJ)
         row = np.clip(((1 - elev / (math.pi / 2)) * (SKY_H - 1)).astype(np.int32), 0, SKY_H - 1)
-        frame[:, :sky_rows] = sky_cur[col[:, None], row[None, :]]
+        C[:, :sky_rows] = SKY_P[col[:, None], row[None, :]]
+        L[:, :sky_rows] = WHITE
 
     # ---- пол ----
     if sky_rows < RH:
-        ys = ROW_IDX[sky_rows:]
-        rowd = (cam_z * PROJ / (ys - horizon)).astype(np.float32)          # (n,)
-        fx = px + rdx[:, None] * rowd[None, :]
-        fy = py + rdy[:, None] * rowd[None, :]
-        cxi = np.clip(fx.astype(np.int32), 0, MAP_W - 1)
-        cyi = np.clip(fy.astype(np.int32), 0, MAP_H - 1)
-        txi = (fx * TEX).astype(np.int32) & (TEX - 1)
-        tyi = (fy * TEX).astype(np.int32) & (TEX - 1)
-        fcol = atlas[floor_map[cyi, cxi], tyi, txi]
-        li = np.clip((fx * LM).astype(np.int32), 0, LMW - 1)
-        lj = np.clip((fy * LM).astype(np.int32), 0, LMH - 1)
-        fcol *= floor_light[lj, li]
-        fog = np.clip((rowd - fog_start) / (fog_end - fog_start), 0, 1)[None, :, None]
-        frame[:, sky_rows:] = fcol + (fog_col - fcol) * fog
+        rowd = (cam_z * PROJ / (ROW_IDX[sky_rows:] - horizon)).astype(np.float32)
+        ix = ((px * TEX) + (rdx * TEX)[:, None] * rowd[None, :]).astype(np.int32)
+        iy = ((py * TEX) + (rdy * TEX)[:, None] * rowd[None, :]).astype(np.int32)
+        np.clip(ix, 0, MAP_W * TEX - 1, out=ix)
+        np.clip(iy, 0, MAP_H * TEX - 1, out=iy)
+        C[:, sky_rows:] = FLOOR_P[iy, ix]
+        L[:, sky_rows:] = LM_P[iy >> 1, ix >> 1]         # LM=8, TEX=16
+        F[:, sky_rows:] = (np.clip((rowd - fog_start) / (fog_end - fog_start), 0, 1) * 255)[None, :]
 
     # ---- стены ----
     line_h = PROJ / perp
     top = horizon - line_h * (1 - cam_z)
-    bottom = top + line_h
     y0 = int(max(0, np.floor(top.min())))
-    y1 = int(min(RH, np.ceil(bottom.max())))
+    y1 = int(min(RH, np.ceil((top + line_h).max())))
     if y1 > y0:
-        v = (ROW_IDX[None, y0:y1] - top[:, None]) / line_h[:, None]        # (RW, n)
+        v = (ROW_IDX[None, y0:y1] - top[:, None]) * (1.0 / line_h)[:, None]   # (RW, n)
         mask = (v >= 0) & (v < 1)
         tyw = np.clip((v * TEX).astype(np.int32), 0, TEX - 1)
-        wcol = atlas[tile[:, None], tyw, tex_x[:, None]]
-
-        # свет в точке попадания (чуть отступив от грани)
-        lx = np.where(side, hx, hx - stx * 0.02)
-        ly = np.where(side, hy - sty * 0.02, hy)
-        li = np.clip((lx * LM).astype(np.int32), 0, LMW - 1)
-        lj = np.clip((ly * LM).astype(np.int32), 0, LMH - 1)
-        face = np.where(side, 0.78, 1.0).astype(np.float32)[:, None]
-        wl = amb[None, :] * face + torch_map[lj, li][:, None] * TORCH_COLOR[None, :]
-        # затемнение у пола (контактная тень)
-        s = np.clip((v - 0.72) / 0.28, 0, 1)
-        ao = 1 - 0.42 * s * s * (3 - 2 * s)
-        wcol *= wl[:, None, :] * ao[..., None]
+        wc = ATLAS_P[tile[:, None], tyw, tex_x[:, None]]
 
         # рамка выделения блока под прицелом
         if target is not None:
@@ -541,19 +602,41 @@ def render_world(t):
             if sel.any():
                 edge = (tex_x == 0) | (tex_x == TEX - 1)
                 outline = sel[:, None] & (edge[:, None] | (tyw == 0) | (tyw == TEX - 1))
-                wcol[sel] *= 1.12
-                wcol[outline] *= 0.15
+                wc[outline] = 0
 
-        fog = np.clip((perp - fog_start) / (fog_end - fog_start), 0, 1)[:, None, None]
-        wcol += (fog_col - wcol) * fog
-        sub = frame[:, y0:y1]
-        np.copyto(sub, wcol, where=mask[..., None])
+        # свет в точке попадания (чуть отступив от грани) x ступени AO у пола
+        lx = np.where(side, hx, hx - stx * 0.02)
+        ly = np.where(side, hy - sty * 0.02, hy)
+        li = np.clip((lx * LM).astype(np.int32), 0, LMW - 1)
+        lj = np.clip((ly * LM).astype(np.int32), 0, LMH - 1)
+        face = np.where(side, 0.78, 1.0).astype(np.float32)[:, None]
+        wl = amb[None, :] * face + torch_map[lj, li][:, None] * TORCH_COLOR[None, :]
+        s = np.linspace(0, 1, AO_LEVELS, dtype=np.float32)
+        ao = 1 - 0.42 * s * s * (3 - 2 * s)
+        wl_p = pack(wl[:, None, :] * ao[None, :, None] * 255)          # (RW, AO_LEVELS)
+        aoi = np.clip(((v - 0.72) * ((AO_LEVELS - 1) / 0.28) + 1).astype(np.int32), 0, AO_LEVELS - 1)
+        wf = (np.clip((perp - fog_start) / (fog_end - fog_start), 0, 1) * 255).astype(np.uint8)
 
-    # ---- спрайты (факелы) ----
+        np.copyto(C[:, y0:y1], wc, where=mask)
+        np.copyto(L[:, y0:y1], wl_p[COLS, aoi], where=mask)
+        np.copyto(F[:, y0:y1], np.broadcast_to(wf[:, None], mask.shape), where=mask)
+
+    # ---- сборка: цвет * свет, затем туман (C-блиты pygame) ----
+    pygame.surfarray.blit_array(small, C)
+    pygame.surfarray.blit_array(light_surf, L)
+    small.blit(light_surf, (0, 0), special_flags=pygame.BLEND_RGB_MULT)
+    fog_surf.fill((int(fog_col[0]), int(fog_col[1]), int(fog_col[2]), 255))
+    fa = pygame.surfarray.pixels_alpha(fog_surf)
+    fa[...] = F
+    del fa
+    small.blit(fog_surf, (0, 0))
+
+    # ---- спрайты (факелы) поверх, с отсечением по z-буферу ----
     inv = 1.0 / (pl_x * dir_y - dir_x * pl_y)
     order = sorted(range(len(TORCHES)),
                    key=lambda i: -((TORCHES[i][0] - px) ** 2 + (TORCHES[i][1] - py) ** 2))
-    spr = TORCH_FRAMES[int(t * 8) % len(TORCH_FRAMES)]
+    spr = TORCH_SURFS[int(t * 8) % len(TORCH_SURFS)]
+    glow_k = 0.3 + 0.7 * night
     for i in order:
         tx, ty = TORCHES[i]
         sx, sy = tx - px, ty - py
@@ -561,42 +644,46 @@ def render_world(t):
         depth = inv * (-pl_y * sx + pl_x * sy)
         if depth < 0.15:
             continue
-        scr_x = (RW / 2) * (1 + trx / depth)
         size = PROJ * 0.55 / depth
-        bot = horizon + PROJ * cam_z / depth
-        top_s = bot - size
-        left = scr_x - size / 2
-        fog = min(1.0, max(0.0, (depth - fog_start) / (fog_end - fog_start)))
-
-        # ореол (аддитивно)
-        glow = 0.25 + 0.75 * night
-        gr = size * 1.6
-        gcx, gcy = scr_x, top_s + size * 0.3
-        gx0, gx1 = max(0, int(gcx - gr)), min(RW, int(gcx + gr) + 1)
-        gy0, gy1 = max(0, int(gcy - gr)), min(RH, int(gcy + gr) + 1)
-        if gx1 > gx0 and gy1 > gy0:
-            gxs = (np.arange(gx0, gx1, dtype=np.float32) - gcx) / gr
-            gys = (np.arange(gy0, gy1, dtype=np.float32) - gcy) / gr
-            g = np.clip(1 - np.sqrt(gxs[:, None] ** 2 + gys[None, :] ** 2), 0, 1) ** 2
-            g *= (perp[gx0:gx1, None] > depth - 0.3) * (glow * flick[i] * 70 * (1 - fog))
-            frame[gx0:gx1, gy0:gy1] += g[..., None] * TORCH_COLOR
-
-        x0, x1 = max(0, int(left)), min(RW, int(left + size) + 1)
-        y0s, y1s = max(0, int(top_s)), min(RH, int(bot) + 1)
-        if x0 >= x1 or y0s >= y1s:
+        if size < 1:
             continue
-        u = np.clip(((np.arange(x0, x1) - left) / size * TEX).astype(np.int32), 0, TEX - 1)
-        vv = np.clip(((np.arange(y0s, y1s) - top_s) / size * TEX).astype(np.int32), 0, TEX - 1)
-        smp = spr[vv[None, :], u[:, None]]                                 # (nx, ny, 4)
-        vis = (smp[..., 3] > 0) & (perp[x0:x1, None] > depth)
-        col = smp[..., :3] + (fog_col - smp[..., :3]) * fog
-        region = frame[x0:x1, y0s:y1s]
-        region[vis] = col[vis]
+        scr_x = (RW / 2) * (1 + trx / depth)
+        bot = horizon + PROJ * cam_z / depth
+        fog = min(1.0, max(0.0, (depth - fog_start) / (fog_end - fog_start)))
+        isz = min(int(size) + 1, RH * 3)
 
-    np.clip(frame, 0, 255, out=frame)
-    pygame.surfarray.blit_array(small, frame.astype(np.uint8))
-    pygame.transform.scale(small, (WIDTH, HEIGHT), screen)
+        # ореол (аддитивно), только там, где факел не закрыт стеной
+        gsz = min(int(size * 3.2) + 1, RW * 2)
+        gl = int(scr_x - gsz / 2)
+        gt = int(bot - size * 0.7 - gsz / 2)
+        gx0, gx1 = max(0, gl), min(RW, gl + gsz)
+        k = glow_k * flick[i] * (1 - fog) * 0.55
+        if gx1 > gx0 and k > 0.02:
+            gs = pygame.transform.scale(GLOW_SURF, (gsz, gsz))
+            kk = int(255 * min(1.0, k))
+            gs.fill((kk, kk, kk), special_flags=pygame.BLEND_RGB_MULT)
+            for a, b in _runs(perp[gx0:gx1] > depth - 0.3):
+                small.blit(gs, (gx0 + a, gt), area=pygame.Rect(gx0 + a - gl, 0, b - a, gsz),
+                           special_flags=pygame.BLEND_RGB_ADD)
 
+        left = int(scr_x - isz / 2)
+        x0, x1 = max(0, left), min(RW, left + isz)
+        if x1 <= x0:
+            continue
+        ss = pygame.transform.scale(spr, (isz, isz))
+        if fog > 0.05:
+            ss.set_alpha(int(255 * (1 - fog)))
+        topy = int(bot) - isz
+        for a, b in _runs(perp[x0:x1] > depth):
+            small.blit(ss, (x0 + a, topy), area=pygame.Rect(x0 + a - left, 0, b - a, isz))
+
+    if small.get_size() == (WIDTH, HEIGHT):
+        screen.blit(small, (0, 0))
+    else:
+        try:
+            pygame.transform.scale(small, (WIDTH, HEIGHT), screen)
+        except (ValueError, pygame.error):
+            screen.blit(pygame.transform.scale(small, (WIDTH, HEIGHT)), (0, 0))
 
 # -------------------------------------------------------- ИКОНКИ БЛОКОВ ----
 def make_block_icon(tile_id, size):
@@ -626,7 +713,7 @@ def make_block_icon(tile_id, size):
     return pygame.image.frombuffer(arr.tobytes(), (S, S), "RGBA").convert_alpha()
 
 
-ICON_SMALL = {b: make_block_icon(b, int(48 * UI)) for b in HOTBAR}
+ICON_SMALL = {b: make_block_icon(b, int(48 * UI * (1.5 if MOBILE else 1))) for b in HOTBAR}
 ICON_HAND = {b: make_block_icon(b, int(220 * UI)) for b in HOTBAR}
 
 # ---------------------------------------------------------- TOUCH-КНОПКИ ---
@@ -676,11 +763,11 @@ class TouchButton:
         surface.blit(self.surf_down if self.active else self.surf_up, self.rect)
 
 
-btn_font = pygame.font.SysFont(None, int(40 * UI))
-font = pygame.font.SysFont(None, max(18, int(26 * UI)))
-big_font = pygame.font.SysFont(None, int(34 * UI))
+btn_font = pygame.font.SysFont(None, max(16, int(40 * UI)))
+font = pygame.font.SysFont(None, max(13, int(26 * UI)))
+big_font = pygame.font.SysFont(None, max(15, int(34 * UI)))
 
-BS, PAD = int(80 * UI * (1.4 if IS_ANDROID else 1)), int(20 * UI)
+BS, PAD = int(80 * UI * (1.6 if MOBILE else 1)), max(6, int(20 * UI))
 mcx, mcy = PAD + BS + 8, HEIGHT - BS - PAD
 rcx, rcy = WIDTH - PAD - 2 * BS - 8, HEIGHT - BS - PAD
 buttons = {
@@ -696,7 +783,7 @@ buttons = {
 }
 show_buttons = True
 
-SLOT = int(64 * UI)
+SLOT = int(64 * UI * (1.5 if MOBILE else 1))
 hotbar_rect = pygame.Rect(0, 0, SLOT * len(HOTBAR) + 8, SLOT + 8)
 hotbar_rect.midbottom = (WIDTH // 2, HEIGHT - 14)
 
@@ -824,18 +911,29 @@ def draw_crosshair():
         pygame.draw.line(screen, col, (cx, cy - 12), (cx, cy + 12), w)
 
 
+_hotbar_cache = {}
+
+
 def draw_hotbar():
-    s = pygame.Surface(hotbar_rect.size, pygame.SRCALPHA)
-    s.fill((0, 0, 0, 130))
-    screen.blit(s, hotbar_rect)
-    for i, b in enumerate(HOTBAR):
-        r = pygame.Rect(hotbar_rect.x + 4 + i * SLOT, hotbar_rect.y + 4, SLOT, SLOT)
-        pygame.draw.rect(screen, (140, 140, 140), r, 2)
-        screen.blit(ICON_SMALL[b], ICON_SMALL[b].get_rect(center=r.center))
-        if i == selected_slot:
-            pygame.draw.rect(screen, (255, 255, 255), r.inflate(6, 6), 4)
-    name = big_font.render(BLOCK_NAMES[HOTBAR[selected_slot]], True, (255, 255, 255))
-    screen.blit(name, name.get_rect(midbottom=(hotbar_rect.centerx, hotbar_rect.y - 8)))
+    # хотбар перерисовывается только при смене слота
+    if selected_slot not in _hotbar_cache:
+        name = big_font.render(BLOCK_NAMES[HOTBAR[selected_slot]], True, (255, 255, 255))
+        nh = name.get_height() + 6
+        s = pygame.Surface((hotbar_rect.w + 8, hotbar_rect.h + nh + 4), pygame.SRCALPHA)
+        s.fill((0, 0, 0, 130), pygame.Rect(4, nh, hotbar_rect.w, hotbar_rect.h))
+        for i, b in enumerate(HOTBAR):
+            r = pygame.Rect(8 + i * SLOT, nh + 4, SLOT, SLOT)
+            pygame.draw.rect(s, (140, 140, 140), r, 2)
+            s.blit(ICON_SMALL[b], ICON_SMALL[b].get_rect(center=r.center))
+            if i == selected_slot:
+                pygame.draw.rect(s, (255, 255, 255), r.inflate(4, 4), 3)
+        s.blit(name, name.get_rect(midtop=(s.get_width() // 2, 0)))
+        _hotbar_cache[selected_slot] = (s, nh)
+    s, nh = _hotbar_cache[selected_slot]
+    screen.blit(s, (hotbar_rect.x - 4, hotbar_rect.y - nh))
+
+
+_hand_cache = {}
 
 
 def draw_hand():
@@ -843,14 +941,18 @@ def draw_hand():
     bx = math.cos(bob_phase * 0.5) * 14 * bob_amount
     by = abs(math.sin(bob_phase * 0.5)) * 14 * bob_amount
     sw = math.sin(hand_swing * math.pi)
-    x = WIDTH - icon.get_width() - 230 * UI + bx - sw * 60 * UI
-    y = HEIGHT - icon.get_height() * 0.72 + by + sw * 40
+    base_x = WIDTH * 0.6 if MOBILE else WIDTH - icon.get_width() - 230 * UI
+    x = base_x + bx - sw * 60 * UI
+    y = HEIGHT - icon.get_height() * 0.72 + by + sw * 40 * UI
     # тень от освещения: ночью рука темнее
-    k = 1.0 - 0.6 * night
-    if k < 0.999:
-        icon = icon.copy()
-        icon.fill((int(255 * k),) * 3 + (255,), special_flags=pygame.BLEND_RGBA_MULT)
-    screen.blit(icon, (x, y))
+    k = round((1.0 - 0.6 * night) * 20) / 20         # 20 ступеней, кэшируем
+    key = (HOTBAR[selected_slot], k)
+    if key not in _hand_cache:
+        ic = icon.copy()
+        if k < 0.999:
+            ic.fill((int(255 * k),) * 3 + (255,), special_flags=pygame.BLEND_RGBA_MULT)
+        _hand_cache[key] = ic
+    screen.blit(_hand_cache[key], (x, y))
 
 
 HELP = [
@@ -872,12 +974,15 @@ def main():
     global bob_phase, bob_amount, hand_swing, show_buttons
 
     setup_resolution(RENDER_DIV)
+    build_sprite_surfaces()
     map_changed()
 
     clock = pygame.time.Clock()
     keys_held = set()
     mouse_look = False
     show_debug = True
+    show_help = not MOBILE
+    look_finger = None        # палец, которым крутят камеру (свайп)
     fps_surf = None
     fps_timer = 0.0
     t = 0.0
@@ -903,8 +1008,11 @@ def main():
             perf_t += raw_dt
             perf_n += 1
             if perf_t > 2.0:
-                if perf_t / perf_n > 1 / 25 and RENDER_DIV < 8:
+                avg = perf_t / perf_n
+                if avg > 1 / 28 and RENDER_DIV < 8:
                     setup_resolution(RENDER_DIV + 1)
+                elif avg < 1 / 55 and RENDER_DIV > (2 if MOBILE else 3):
+                    setup_resolution(RENDER_DIV - 1)
                 perf_t, perf_n = 0.0, 0
 
         for event in pygame.event.get():
@@ -982,12 +1090,23 @@ def main():
                     slot = hotbar_slot_at(pos)
                     if slot is not None:
                         selected_slot = slot
-                    for b in buttons.values():
-                        b.press(pid, pos)
+                        continue
+                    on_btn = False
+                    if show_buttons:
+                        for b in buttons.values():
+                            on_btn = b.press(pid, pos) or on_btn
+                    if not on_btn and look_finger is None:
+                        look_finger = pid           # свайп по пустому месту = обзор
                 elif event.type == EV_FINGERMOTION:
-                    for b in buttons.values():
-                        b.move(pid, pos)
+                    if pid == look_finger:
+                        p_angle += event.dx * TOUCH_LOOK_X
+                        pitch = max(-0.45, min(0.45, pitch - event.dy * TOUCH_LOOK_Y))
+                    else:
+                        for b in buttons.values():
+                            b.move(pid, pos)
                 else:
+                    if pid == look_finger:
+                        look_finger = None
                     for b in buttons.values():
                         b.release(pid)
 
@@ -1058,9 +1177,10 @@ def main():
                     f"x={px:.2f} y={py:.2f} угол={math.degrees(p_angle):.0f}")
             fps_surf = font.render(info, True, (255, 255, 255))
         if show_debug and fps_surf:
-            screen.blit(fps_surf, (12, 10))
-            for i, s in enumerate(help_surfs):
-                screen.blit(s, (12, 38 + i * 24))
+            screen.blit(fps_surf, (8, 6))
+            if show_help:
+                for i, s in enumerate(help_surfs):
+                    screen.blit(s, (12, 14 + (i + 1) * font.get_linesize()))
 
         if show_buttons:
             for b in buttons.values():
